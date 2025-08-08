@@ -230,10 +230,14 @@ void GstVideoPlayer::UnrefEGLImage() {
 const uint8_t* GstVideoPlayer::GetFrameBuffer() {
   std::shared_lock<std::shared_mutex> lock(mutex_buffer_);
   if (!gst_.buffer) {
+    std::cout << "⚠️ GetFrameBuffer called but no buffer available" << std::endl;
     return nullptr;
   }
 
   const uint32_t pixel_bytes = width_ * height_ * 4;
+  std::cout << "🖼️ GetFrameBuffer: extracting " << pixel_bytes << " bytes (" 
+            << width_ << "x" << height_ << ")" << std::endl;
+  
   gst_buffer_extract(gst_.buffer, 0, pixels_.get(), pixel_bytes);
   return reinterpret_cast<const uint8_t*>(pixels_.get());
 }
@@ -465,29 +469,59 @@ void GstVideoPlayer::GetVideoSize(int32_t& width, int32_t& height) {
 void GstVideoPlayer::HandoffHandler(GstElement* fakesink, GstBuffer* buf,
                                     GstPad* new_pad, gpointer user_data) {
   auto* self = reinterpret_cast<GstVideoPlayer*>(user_data);
+  
+  // DEBUG: Frame reception confirmation
+  static int frame_count = 0;
+  frame_count++;
+  std::cout << "📹 Frame " << frame_count << " received in HandoffHandler" << std::endl;
+  
   auto* caps = gst_pad_get_current_caps(new_pad);
+  if (!caps) {
+    std::cerr << "❌ No caps available in HandoffHandler" << std::endl;
+    return;
+  }
+  
   auto* structure = gst_caps_get_structure(caps, 0);
+  if (!structure) {
+    std::cerr << "❌ No structure available in HandoffHandler" << std::endl;
+    gst_caps_unref(caps);
+    return;
+  }
 
-  int width;
-  int height;
+  int width, height;
   gst_structure_get_int(structure, "width", &width);
   gst_structure_get_int(structure, "height", &height);
+  
+  // DEBUG: Frame format information
+  const gchar* format = gst_structure_get_string(structure, "format");
+  std::cout << "📐 Frame format: " << (format ? format : "unknown") 
+            << ", size: " << width << "x" << height << std::endl;
+  
   gst_caps_unref(caps);
+  
   if (width != self->width_ || height != self->height_) {
     self->width_ = width;
     self->height_ = height;
     self->pixels_.reset(new uint32_t[width * height]);
-    std::cout << "Pixel buffer size: width = " << width
-              << ", height = " << height << std::endl;
+    std::cout << "🔄 Buffer resized: " << width << "x" << height << std::endl;
   }
 
+  // Buffer management
   std::lock_guard<std::shared_mutex> lock(self->mutex_buffer_);
   if (self->gst_.buffer) {
     gst_buffer_unref(self->gst_.buffer);
     self->gst_.buffer = nullptr;
   }
   self->gst_.buffer = gst_buffer_ref(buf);
+  
+  // DEBUG: Buffer information
+  gsize buffer_size = gst_buffer_get_size(buf);
+  std::cout << "💾 Buffer size: " << buffer_size << " bytes" << std::endl;
+  
+  // CRITICAL: This is where Flutter should be notified
+  std::cout << "🔔 Calling OnNotifyFrameDecoded..." << std::endl;
   self->stream_handler_->OnNotifyFrameDecoded();
+  std::cout << "✅ OnNotifyFrameDecoded called" << std::endl;
 }
 
 // static
