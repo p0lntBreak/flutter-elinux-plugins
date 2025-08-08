@@ -241,70 +241,102 @@ const uint8_t* GstVideoPlayer::GetFrameBuffer() {
 // Creats a video pipeline using playbin.
 // $ playbin uri=<file> video-sink="videoconvert ! video/x-raw,format=RGBA !
 // fakesink"
+
+//new code
 bool GstVideoPlayer::CreatePipeline() {
   gst_.pipeline = gst_pipeline_new("pipeline");
   if (!gst_.pipeline) {
     std::cerr << "Failed to create a pipeline" << std::endl;
     return false;
   }
+  
   gst_.playbin = gst_element_factory_make("playbin", "playbin");
   if (!gst_.playbin) {
-    std::cerr << "Failed to create a source" << std::endl;
+    std::cerr << "Failed to create playbin" << std::endl;
     return false;
   }
+
+  // Keep using videoconvert (v4l2convert might not be available based on your listing)
   gst_.video_convert = gst_element_factory_make("videoconvert", "videoconvert");
   if (!gst_.video_convert) {
-    std::cerr << "Failed to create a videoconvert" << std::endl;
+    std::cerr << "Failed to create videoconvert" << std::endl;
     return false;
   }
+  
+  // CRITICAL: Force fakesink creation to prevent GL sink auto-selection
   gst_.video_sink = gst_element_factory_make("fakesink", "videosink");
   if (!gst_.video_sink) {
-    std::cerr << "Failed to create a videosink" << std::endl;
+    std::cerr << "Failed to create fakesink" << std::endl;
     return false;
   }
+  
   gst_.output = gst_bin_new("output");
   if (!gst_.output) {
-    std::cerr << "Failed to create an output" << std::endl;
+    std::cerr << "Failed to create output bin" << std::endl;
     return false;
   }
+  
   gst_.bus = gst_pipeline_get_bus(GST_PIPELINE(gst_.pipeline));
   if (!gst_.bus) {
-    std::cerr << "Failed to create a bus" << std::endl;
+    std::cerr << "Failed to get bus" << std::endl;
     return false;
   }
   gst_bus_set_sync_handler(gst_.bus, HandleGstMessage, this, NULL);
 
-  // Sets properties to fakesink to get the callback of a decoded frame.
-  g_object_set(G_OBJECT(gst_.video_sink), "sync", TRUE, "qos", FALSE, NULL);
-  g_object_set(G_OBJECT(gst_.video_sink), "signal-handoffs", TRUE, NULL);
-  g_signal_connect(G_OBJECT(gst_.video_sink), "handoff",
-                   G_CALLBACK(HandoffHandler), this);
-  gst_bin_add_many(GST_BIN(gst_.output), gst_.video_convert, gst_.video_sink,
-                   NULL);
-
-  // Adds caps to the converter to convert the color format to RGBA.
-  auto* caps = gst_caps_from_string("video/x-raw,format=RGBA");
-  auto link_ok =
-      gst_element_link_filtered(gst_.video_convert, gst_.video_sink, caps);
-  gst_caps_unref(caps);
-  if (!link_ok) {
-    std::cerr << "Failed to link elements" << std::endl;
+  // Verify we have fakesink before setting its specific properties
+  const gchar* factory_name = gst_plugin_feature_get_name(
+      GST_PLUGIN_FEATURE(gst_element_get_factory(gst_.video_sink)));
+      
+  if (g_strcmp0(factory_name, "fakesink") == 0) {
+    std::cout << "Successfully created fakesink" << std::endl;
+    g_object_set(G_OBJECT(gst_.video_sink), 
+                 "sync", TRUE, 
+                 "qos", FALSE,
+                 "signal-handoffs", TRUE, 
+                 NULL);
+    g_signal_connect(G_OBJECT(gst_.video_sink), "handoff",
+                     G_CALLBACK(HandoffHandler), this);
+  } else {
+    std::cerr << "ERROR: Expected fakesink but got " << factory_name << std::endl;
     return false;
   }
 
+  gst_bin_add_many(GST_BIN(gst_.output), gst_.video_convert, gst_.video_sink, NULL);
+
+  // Link with RGBA format for consistent frame capture
+  auto* caps = gst_caps_from_string("video/x-raw,format=RGBA");
+  auto link_ok = gst_element_link_filtered(gst_.video_convert, gst_.video_sink, caps);
+  gst_caps_unref(caps);
+  
+  if (!link_ok) {
+    std::cerr << "Failed to link video elements" << std::endl;
+    return false;
+  }
+
+  // Create ghost pad for the bin
   auto* sinkpad = gst_element_get_static_pad(gst_.video_convert, "sink");
   auto* ghost_sinkpad = gst_ghost_pad_new("sink", sinkpad);
   gst_pad_set_active(ghost_sinkpad, TRUE);
   gst_element_add_pad(gst_.output, ghost_sinkpad);
   gst_object_unref(sinkpad);
 
-  // Sets properties to playbin.
+  // Configure playbin - CRITICAL settings to prevent GL sink auto-selection
   g_object_set(gst_.playbin, "uri", uri_.c_str(), NULL);
   g_object_set(gst_.playbin, "video-sink", gst_.output, NULL);
-  gst_bin_add_many(GST_BIN(gst_.pipeline), gst_.playbin, NULL);
+  
+  // Disable GL/hardware rendering flags that might trigger glimagesink selection
+  // Use only basic audio + video flags
+  g_object_set(gst_.playbin, "flags", 0x00000001 | 0x00000002, NULL); // AUDIO + VIDEO only
+  
+  // Force software decoding if hardware causes issues (optional)
+  // g_object_set(gst_.playbin, "force-sw-decoders", TRUE, NULL);
+  
+  gst_bin_add(GST_BIN(gst_.pipeline), gst_.playbin);
 
+  std::cout << "Pipeline created successfully with fakesink" << std::endl;
   return true;
 }
+// new code
 
 bool GstVideoPlayer::Preroll() {
   if (!gst_.playbin) {
@@ -330,9 +362,16 @@ bool GstVideoPlayer::Preroll() {
   return true;
 }
 
+// Also add this improved DestroyPipeline method
 void GstVideoPlayer::DestroyPipeline() {
   if (gst_.video_sink) {
-    g_object_set(G_OBJECT(gst_.video_sink), "signal-handoffs", FALSE, NULL);
+    // Verify it's fakesink before accessing its properties
+    const gchar* factory_name = gst_plugin_feature_get_name(
+        GST_PLUGIN_FEATURE(gst_element_get_factory(gst_.video_sink)));
+    
+    if (g_strcmp0(factory_name, "fakesink") == 0) {
+      g_object_set(G_OBJECT(gst_.video_sink), "signal-handoffs", FALSE, NULL);
+    }
   }
 
   if (gst_.pipeline) {
@@ -354,21 +393,11 @@ void GstVideoPlayer::DestroyPipeline() {
     gst_.pipeline = nullptr;
   }
 
-  if (gst_.playbin) {
-    gst_.playbin = nullptr;
-  }
-
-  if (gst_.output) {
-    gst_.output = nullptr;
-  }
-
-  if (gst_.video_sink) {
-    gst_.video_sink = nullptr;
-  }
-
-  if (gst_.video_convert) {
-    gst_.video_convert = nullptr;
-  }
+  // These are owned by pipeline/bins, just null the pointers
+  gst_.playbin = nullptr;
+  gst_.output = nullptr;  
+  gst_.video_sink = nullptr;
+  gst_.video_convert = nullptr;
 }
 
 std::string GstVideoPlayer::ParseUri(const std::string& uri) {
